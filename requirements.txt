@@ -1,0 +1,36 @@
+# API Framework
+fastapi[standard]==0.119.0  # Includes uvicorn[standard] with uvloop
+pydantic==2.10.3
+pydantic-settings==2.6.1
+python-multipart==0.0.18
+
+# Document Processing
+unstructured[all-docs]==0.16.9
+python-magic==0.4.27  # For file type detection (uses system libmagic on macOS)
+pillow==11.0.0  # Image processing for document parsing
+
+# Embeddings & Vector DB
+openai==2.9.0  # Latest version, required by opik>=1.99.5
+pinecone[grpc]==6.0.2  # Latest version with gRPC for better performance
+tiktoken==0.8.0
+
+# Text-to-SQL
+vanna==2.0.1  # Latest Vanna with OpenAI support
+sqlalchemy==2.0.36
+psycopg2-binary==2.9.10
+faker==33.1.0  # For generating sample data
+
+# Evaluation & Monitoring
+ragas==0.2.9
+datasets==3.2.0
+opik==1.9.45
+
+# Utilities
+python-dotenv==1.0.1
+httpx==0.28.1  # For async HTTP requests
+
+# Development
+pytest==8.3.4
+pytest-asyncio==0.24.0
+black==24.10.0
+ruff==0.8.4
