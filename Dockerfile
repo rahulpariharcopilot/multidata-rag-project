@@ -21,6 +21,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     # Build tools for compiling Python packages
     gcc \
     g++ \
+    # Required for rtree (spatial indexing library used by docling)
+    libspatialindex-dev \
+    # Required for OpenCV (used by docling for image processing)
+    libgl1 \
+    libglib2.0-0 \
     # Clean up to reduce image size
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
@@ -57,7 +62,8 @@ COPY evaluate.py .
 COPY tests/ ./tests/
 
 # Create necessary directories
-RUN mkdir -p data/uploads data/vanna_chromadb
+RUN mkdir -p data/uploads
+# Note: Vanna 2.0 now uses Pinecone cloud storage (no local vanna_chromadb needed)
 
 # Expose port
 EXPOSE 8000

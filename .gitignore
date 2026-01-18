@@ -43,6 +43,10 @@ env/
 data/uploads/*
 !data/uploads/.gitkeep
 
+# Cache directory (ignore cached files but keep structure)
+data/cached_chunks/*
+!data/cached_chunks/.gitkeep
+
 # Vanna ChromaDB storage
 data/vanna_chromadb/
 
@@ -75,3 +79,34 @@ evaluation_results.json
 .claude/
 !.claude/settings.local.json
 claude.md
+
+notebooks/*# Log files
+*.log
+*.log.*
+logs/*.log
+logs/*.log.*
+!logs/.gitkeep
+
+
+docs/*
+
+notebooks/database_relationships_tutorial.ipynb
+notebooks/vanna_ai_text_to_sql_tutorial_legacy.ipynb
+notebooks/vanna_ai_text_to_sql_tutorial.ipynb
+
+.gitignore
+
+.claude/*
+CLAUDE.md
+
+app/services/sql_service.py.backup_vanna0x
+
+DEPLOYMENT.md
+LAMBDA_LAYERS.md
+
+deploy_docs/*
+
+workflows/*
+notebooks/quickstart.ipynb
+notebooks/TESTING_GUIDE.md
+notebooks/IMPLEMENTATION_SUMMARY.md

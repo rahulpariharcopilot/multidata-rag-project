@@ -3,6 +3,7 @@ Multi-Source RAG + Text-to-SQL API
 FastAPI application with document RAG and natural language to SQL capabilities.
 """
 
+from typing import Optional
 from fastapi import FastAPI, status, UploadFile, File, HTTPException
 from fastapi.responses import JSONResponse
 from datetime import datetime
@@ -11,16 +12,21 @@ import sys
 import shutil
 
 from app.config import settings
+from app.logging_config import setup_logging, get_logger
 from app.services.document_service import parse_document, chunk_text
 from app.services.embedding_service import EmbeddingService
 from app.services.vector_service import VectorService
 from app.services.rag_service import RAGService
 from app.services.sql_service import TextToSQLService
 from app.services.router_service import QueryRouter
+from app.services.cache_service import CacheService
 from app.utils import (
     FileValidator, QueryValidator, ValidationError,
     ErrorResponse, format_file_size, truncate_text
 )
+
+# Initialize logging
+logger = setup_logging(log_level="INFO")
 
 # OPIK monitoring (optional - gracefully handles if not configured)
 try:
@@ -40,6 +46,7 @@ app = FastAPI(
     version="0.1.0",
     docs_url="/docs",
     redoc_url="/redoc",
+    root_path=settings.ROOT_PATH,  # For API Gateway: "/prod", for local: ""
 )
 
 # Global service instances (initialized on startup if API keys are available)
@@ -47,10 +54,11 @@ embedding_service: EmbeddingService | None = None
 vector_service: VectorService | None = None
 rag_service: RAGService | None = None
 sql_service: TextToSQLService | None = None
+cache_service: CacheService | None = None
 
-# Upload directory
-UPLOAD_DIR = Path("data/uploads")
-UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+# Upload directory (from config, supports both Lambda /tmp and local paths)
+UPLOAD_DIR = Path(settings.UPLOAD_DIR)
+CACHE_DIR = Path(settings.CACHE_DIR)
 
 
 @app.get("/health", status_code=status.HTTP_200_OK, tags=["Health"])
@@ -166,18 +174,20 @@ async def root():
 async def upload_document(file: UploadFile = File(...)):
     """
     Upload and process a document (PDF, DOCX, CSV, JSON, TXT).
-    Pipeline: validate → save → parse → chunk → embed → store in Pinecone
+    Pipeline: validate → save → [cache check] → parse → chunk → embed → cache → store
+
+    NEW: Implements intelligent caching to avoid re-processing identical documents.
 
     Args:
         file: The document file to upload (max 50 MB)
 
     Returns:
-        dict: Upload status with filename and chunks created
+        dict: Upload status with filename, chunks created, and cache_hit indicator
 
     Raises:
         HTTPException: If validation fails or services unavailable
     """
-    global embedding_service, vector_service
+    global embedding_service, vector_service, cache_service
 
     # Validate file
     try:
@@ -204,21 +214,84 @@ async def upload_document(file: UploadFile = File(...)):
         with open(file_path, "wb") as buffer:
             shutil.copyfileobj(file.file, buffer)
 
-        # Parse document
-        print(f"Parsing document: {file.filename}")
-        text = parse_document(str(file_path))
+        # NEW: Compute unique document ID from file contents
+        doc_id = None
+        cache_hit = False
+        chunks = None
+        embeddings = None
 
-        # Chunk text
-        print(f"Chunking text...")
-        chunks = chunk_text(text, chunk_size=settings.CHUNK_SIZE, overlap=settings.CHUNK_OVERLAP)
+        if cache_service:
+            try:
+                doc_id = cache_service.compute_document_id(file_path)
+                logger.info(f"Document ID computed: {doc_id}")
 
-        # Generate embeddings
-        print(f"Generating embeddings for {len(chunks)} chunks...")
-        texts = [chunk['text'] for chunk in chunks]
-        embeddings = await embedding_service.generate_embeddings(texts)
+                # NEW: Check if cache exists for this document
+                if cache_service.cache_exists(doc_id):
+                    logger.info(f"Cache HIT for document: {file.filename} (ID: {doc_id[:8]}...)")
 
-        # Store in Pinecone
-        print(f"Storing vectors in Pinecone...")
+                    # Load from cache
+                    cached_data = cache_service.load_chunks_and_embeddings(doc_id)
+
+                    if cached_data:
+                        chunks = cached_data['chunks']
+                        embeddings = cached_data['embeddings']
+                        cache_hit = True
+                        logger.info(f"Loaded {len(chunks)} chunks from cache, skipping processing")
+                    else:
+                        logger.warning("Cache load failed, falling back to full processing")
+                else:
+                    logger.info(f"Cache MISS for document: {file.filename} (ID: {doc_id[:8]}...)")
+
+            except Exception as e:
+                logger.warning(f"Cache check failed, proceeding with full processing: {e}")
+
+        # If cache miss or cache unavailable, process document
+        if chunks is None or embeddings is None:
+            # Parse and chunk with context-aware approach (Docling with smart merging)
+            logger.info(f"Parsing and chunking document with context awareness: {file.filename}")
+            from app.services.document_service import parse_and_chunk_with_context
+            chunks = parse_and_chunk_with_context(
+                str(file_path),
+                chunk_size=settings.CHUNK_SIZE,
+                min_chunk_size=settings.MIN_CHUNK_SIZE
+            )
+            logger.info(f"Created {len(chunks)} context-aware chunks (target {settings.MIN_CHUNK_SIZE}-{settings.CHUNK_SIZE} tokens)")
+
+            # Generate embeddings
+            logger.info(f"Generating embeddings for {len(chunks)} chunks...")
+            texts = [chunk['text'] for chunk in chunks]
+            embeddings = await embedding_service.generate_embeddings(texts)
+
+            # NEW: Save to cache if cache service is available
+            if cache_service and doc_id:
+                try:
+                    # Prepare metadata
+                    metadata = {
+                        "document_id": doc_id,
+                        "original_filename": file.filename,
+                        "upload_timestamp": datetime.utcnow().isoformat() + "Z",
+                        "file_size_bytes": file_path.stat().st_size,
+                        "chunk_count": len(chunks),
+                        "embedding_model": "text-embedding-3-small",
+                        "chunk_size": settings.CHUNK_SIZE,
+                        "chunk_overlap": settings.CHUNK_OVERLAP
+                    }
+
+                    # Save to cache
+                    cache_service.save_chunks_and_embeddings(
+                        doc_id=doc_id,
+                        chunks=chunks,
+                        embeddings=embeddings,
+                        metadata=metadata
+                    )
+                    logger.info(f"Saved to cache: {doc_id}")
+
+                except Exception as e:
+                    # Don't fail upload if caching fails
+                    logger.warning(f"Failed to save to cache (continuing anyway): {e}")
+
+        # Store in Pinecone (always, even on cache hit - in case vector DB was cleared)
+        logger.info(f"Storing {len(chunks)} vectors in Pinecone...")
         vector_service.add_documents(
             chunks=chunks,
             embeddings=embeddings,
@@ -231,11 +304,17 @@ async def upload_document(file: UploadFile = File(...)):
         return {
             "status": "success",
             "filename": file.filename,
+            "document_id": doc_id[:16] + "..." if doc_id else None,  # Show first 16 chars
             "file_size": format_file_size(file_size),
             "file_size_bytes": file_size,
             "chunks_created": len(chunks),
             "total_tokens": sum(chunk['token_count'] for chunk in chunks),
-            "message": f"Document processed and {len(chunks)} chunks stored in Pinecone"
+            "cache_hit": cache_hit,  # NEW: Indicate if cache was used
+            "message": (
+                f"Document loaded from cache and {len(chunks)} chunks stored in Pinecone"
+                if cache_hit
+                else f"Document processed and {len(chunks)} chunks stored in Pinecone"
+            )
         }
 
     except ValidationError as e:
@@ -393,6 +472,77 @@ async def get_stats():
         )
 
 
+@app.get("/cache/stats", status_code=status.HTTP_200_OK, tags=["Cache"])
+async def get_cache_stats():
+    """
+    Get cache statistics (total documents, size, etc.).
+
+    Returns:
+        dict: Cache statistics including document count and total size
+    """
+    global cache_service
+
+    if not cache_service:
+        raise HTTPException(
+            status_code=503,
+            detail=ErrorResponse.service_unavailable(
+                "Cache service",
+                "Cache service not initialized"
+            )
+        )
+
+    try:
+        stats = cache_service.get_cache_stats()
+        return {
+            "status": "success",
+            "cache_stats": stats,
+            "message": f"Cache contains {stats['total_documents']} documents"
+        }
+
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=ErrorResponse.internal_error("get cache stats", e)
+        )
+
+
+@app.delete("/cache/clear", status_code=status.HTTP_200_OK, tags=["Cache"])
+async def clear_cache(document_id: Optional[str] = None):
+    """
+    Clear cache for specific document or entire cache.
+
+    Args:
+        document_id: Optional document ID to clear (if not provided, clears all cache)
+
+    Returns:
+        dict: Result of cache clearing operation
+    """
+    global cache_service
+
+    if not cache_service:
+        raise HTTPException(
+            status_code=503,
+            detail=ErrorResponse.service_unavailable(
+                "Cache service",
+                "Cache service not initialized"
+            )
+        )
+
+    try:
+        result = cache_service.clear_cache(doc_id=document_id)
+
+        return {
+            "status": "success" if result['cleared'] else "failed",
+            **result
+        }
+
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=ErrorResponse.internal_error("clear cache", e)
+        )
+
+
 @app.post("/query", status_code=status.HTTP_200_OK, tags=["Query"])
 @track(name="unified_query")
 async def unified_query(question: str, auto_approve_sql: bool = False, top_k: int = 3):
@@ -429,11 +579,11 @@ async def unified_query(question: str, auto_approve_sql: bool = False, top_k: in
                 )
 
             # Generate SQL
-            sql_result = sql_service.generate_sql_for_approval(question)
+            sql_result = await sql_service.generate_sql_for_approval(question)
 
             if auto_approve_sql:
                 # Auto-execute for testing
-                execution_result = sql_service.execute_approved_query(
+                execution_result = await sql_service.execute_approved_query(
                     sql_result['query_id'],
                     approved=True
                 )
@@ -492,10 +642,10 @@ async def unified_query(question: str, auto_approve_sql: bool = False, top_k: in
                 )
 
             # Get SQL results
-            sql_result = sql_service.generate_sql_for_approval(question)
+            sql_result = await sql_service.generate_sql_for_approval(question)
 
             if auto_approve_sql:
-                execution_result = sql_service.execute_approved_query(
+                execution_result = await sql_service.execute_approved_query(
                     sql_result['query_id'],
                     approved=True
                 )
@@ -563,7 +713,7 @@ async def generate_sql(question: str):
         )
 
     try:
-        result = sql_service.generate_sql_for_approval(question)
+        result = await sql_service.generate_sql_for_approval(question)
         return result
 
     except Exception as e:
@@ -592,7 +742,7 @@ async def execute_sql(query_id: str, approved: bool = True):
         )
 
     try:
-        result = sql_service.execute_approved_query(query_id, approved)
+        result = await sql_service.execute_approved_query(query_id, approved)
 
         if result.get('status') == 'error':
             raise HTTPException(status_code=400, detail=result.get('error', 'Unknown error'))
@@ -632,82 +782,101 @@ async def list_pending_sql_queries():
         raise HTTPException(status_code=500, detail=f"Failed to list pending queries: {str(e)}")
 
 
-# Event handlers for startup/shutdown
-@app.on_event("startup")
-async def startup_event():
-    """Execute tasks on application startup."""
-    global embedding_service, vector_service, rag_service, sql_service
+def initialize_services():
+    """Initialize all services. Called directly on Lambda startup or via FastAPI startup event."""
+    global embedding_service, vector_service, rag_service, sql_service, cache_service
 
-    print("=" * 60)
-    print("Starting Multi-Source RAG + Text-to-SQL API...")
-    print("=" * 60)
-    print("Phase 0: Foundation Setup - COMPLETE")
-    print("Phase 1: Document RAG MVP - COMPLETE")
-    print("Phase 2: Text-to-SQL Foundation - COMPLETE")
-    print("Phase 3: Query Routing - COMPLETE")
-    print("Phase 4: Evaluation & Monitoring - COMPLETE")
-    print("Phase 5: Polish & Documentation - COMPLETE")
-    print("Phase 6: Docker Deployment - COMPLETE")
-    print("=" * 60)
-    print("ALL PHASES COMPLETE - PRODUCTION READY!")
-    print("=" * 60)
+    # Ensure upload and cache directories exist
+    UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    logger.info(f"Storage directories initialized: {UPLOAD_DIR}, {CACHE_DIR}")
+
+    logger.info("=" * 60)
+    logger.info("Starting Multi-Source RAG + Text-to-SQL API...")
+    logger.info("=" * 60)
+    logger.info("Phase 0: Foundation Setup - COMPLETE")
+    logger.info("Phase 1: Document RAG MVP - COMPLETE")
+    logger.info("Phase 2: Text-to-SQL Foundation - COMPLETE")
+    logger.info("Phase 3: Query Routing - COMPLETE")
+    logger.info("Phase 4: Evaluation & Monitoring - COMPLETE")
+    logger.info("Phase 5: Polish & Documentation - COMPLETE")
+    logger.info("Phase 6: Docker Deployment - COMPLETE")
+    logger.info("=" * 60)
+    logger.info("ALL PHASES COMPLETE - PRODUCTION READY!")
+    logger.info("=" * 60)
 
     # Initialize OPIK monitoring if available
     if OPIK_AVAILABLE:
         try:
             if settings.OPIK_API_KEY:
-                print("\nInitializing OPIK monitoring...")
+                logger.info("Initializing OPIK monitoring...")
                 from opik import configure
                 configure(api_key=settings.OPIK_API_KEY)
-                print("✓ OPIK monitoring initialized!")
+                logger.info("✓ OPIK monitoring initialized!")
             else:
-                print("\nOPIK available but API key not configured.")
-                print("Monitoring will use local tracking only.")
+                logger.warning("OPIK available but API key not configured.")
+                logger.info("Monitoring will use local tracking only.")
         except Exception as e:
-            print(f"\nWARNING: Failed to initialize OPIK: {e}")
+            logger.warning(f"Failed to initialize OPIK: {e}")
     else:
-        print("\nOPIK not available (package not installed).")
+        logger.info("OPIK not available (package not installed).")
 
     # Initialize Document RAG services if API keys are available
     try:
         if settings.OPENAI_API_KEY and settings.PINECONE_API_KEY:
-            print("\nInitializing Document RAG services...")
+            logger.info("Initializing Document RAG services...")
             embedding_service = EmbeddingService()
             vector_service = VectorService()
             vector_service.connect_to_index()
             rag_service = RAGService()
-            print("✓ Document RAG services initialized!")
+            logger.info("✓ Document RAG services initialized!")
         else:
-            print("\nWARNING: OpenAI/Pinecone API keys not configured.")
-            print("Document RAG features will be unavailable.")
+            logger.warning("OpenAI/Pinecone API keys not configured.")
+            logger.warning("Document RAG features will be unavailable.")
     except Exception as e:
-        print(f"\nWARNING: Failed to initialize RAG services: {e}")
-        print("Document RAG features will be unavailable.")
+        logger.error(f"Failed to initialize RAG services: {e}", exc_info=True)
+        logger.warning("Document RAG features will be unavailable.")
 
     # Initialize Text-to-SQL service if database is available
     try:
         if settings.DATABASE_URL and settings.OPENAI_API_KEY:
-            print("\nInitializing Text-to-SQL service...")
+            logger.info("Initializing Text-to-SQL service...")
             sql_service = TextToSQLService()
-            print("Training Vanna on database schema and examples...")
+            logger.info("Training Vanna on database schema and examples...")
             sql_service.complete_training()
-            print("✓ Text-to-SQL service initialized and trained!")
+            logger.info("✓ Text-to-SQL service initialized and trained!")
         else:
-            print("\nWARNING: DATABASE_URL not configured.")
-            print("Text-to-SQL features will be unavailable.")
+            logger.warning("DATABASE_URL not configured.")
+            logger.warning("Text-to-SQL features will be unavailable.")
     except Exception as e:
-        print(f"\nWARNING: Failed to initialize SQL service: {e}")
-        print("Text-to-SQL features will be unavailable.")
+        logger.error(f"Failed to initialize SQL service: {e}", exc_info=True)
+        logger.warning("Text-to-SQL features will be unavailable.")
 
-    print("\n" + "=" * 60)
-    print("API is ready! Visit http://localhost:8000/docs")
-    print("=" * 60)
+    # Initialize cache service (always available, no API key needed)
+    try:
+        logger.info("Initializing cache service...")
+        cache_service = CacheService(cache_dir=CACHE_DIR)
+        logger.info("✓ Cache service initialized!")
+    except Exception as e:
+        logger.error(f"✗ Failed to initialize cache service: {e}")
+        logger.warning("Document uploads will work but caching will be unavailable.")
+
+    logger.info("=" * 60)
+    logger.info("API is ready!")
+    logger.info("=" * 60)
+
+
+# Event handlers for startup/shutdown
+@app.on_event("startup")
+async def startup_event():
+    """Execute tasks on application startup."""
+    initialize_services()
 
 
 @app.on_event("shutdown")
 async def shutdown_event():
     """Execute cleanup tasks on application shutdown."""
-    print("Shutting down Multi-Source RAG + Text-to-SQL API...")
+    logger.info("Shutting down Multi-Source RAG + Text-to-SQL API...")
 
 
 if __name__ == "__main__":
