@@ -107,3 +107,6 @@ LAMBDA_LAYERS.md
 deploy_docs/*
 
 workflows/*
+notebooks/quickstart.ipynb
+notebooks/TESTING_GUIDE.md
+notebooks/IMPLEMENTATION_SUMMARY.md
