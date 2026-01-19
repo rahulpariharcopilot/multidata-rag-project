@@ -189,7 +189,6 @@ jobs:
           jq '. + {
             "STORAGE_BACKEND": "s3",
             "S3_CACHE_BUCKET": "${{ secrets.S3_CACHE_BUCKET }}",
-            "AWS_REGION": "${{ env.AWS_REGION }}",
             "ENVIRONMENT": "production"
           }' /tmp/current-vars.json | jq '{Variables: .}' > /tmp/env-config.json
 
