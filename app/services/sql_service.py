@@ -251,19 +251,21 @@ class TextToSQLService:
     Maintains compatibility with existing FastAPI endpoints.
     """
 
-    def __init__(self, database_url: str | None = None, openai_api_key: str | None = None):
+    def __init__(self, database_url: str | None = None, openai_api_key: str | None = None, query_cache_service=None):
         """
         Initialize the Text-to-SQL service with Vanna 2.0 Agent.
 
         Args:
             database_url: PostgreSQL connection string
             openai_api_key: OpenAI API key
+            query_cache_service: Optional QueryCacheService for SQL caching
 
         Raises:
             ValueError: If required credentials are missing
         """
         self.database_url = database_url or settings.DATABASE_URL
         self.openai_api_key = openai_api_key or settings.OPENAI_API_KEY
+        self.query_cache_service = query_cache_service  # Optional cache service
 
         # Validation
         if not self.database_url:
@@ -399,11 +401,16 @@ Columns:
         Generate SQL from a natural language question using Vanna 2.0 Agent.
         Returns SQL for user approval before execution.
 
+        NEW: Implements SQL generation caching to save ~$0.08 per cache hit.
+        - Cache key: hash(question)
+        - Cache TTL: 24 hours (schema relatively stable)
+        - Falls back to uncached if Redis unavailable
+
         Args:
             question: Natural language question
 
         Returns:
-            Dictionary with query_id, question, SQL, and status
+            Dictionary with query_id, question, SQL, status, and cache_hit indicator
 
         Raises:
             Exception: If schema context not prepared or SQL generation fails
@@ -411,12 +418,56 @@ Columns:
         if not self.is_trained:
             raise Exception("Schema context not prepared. Call complete_training() first.")
 
+        # Check cache first (if cache service is available)
+        if self.query_cache_service and self.query_cache_service.enabled:
+            cache_key = self.query_cache_service.get_sql_gen_key(question)
+            cached_result = self.query_cache_service.get(cache_key, cache_type="sql_gen")
+
+            if cached_result and "sql" in cached_result:
+                logger.info(f"SQL generation cache HIT for question: '{question[:50]}...'")
+
+                # Create new query ID for approval workflow (even for cached SQL)
+                query_id = str(uuid.uuid4())
+
+                # Store in pending queries
+                self.pending_queries[query_id] = {
+                    'question': question,
+                    'sql': cached_result["sql"],
+                    'status': 'pending_approval',
+                    'generated_at': pd.Timestamp.now().isoformat(),
+                    'cache_hit': True
+                }
+
+                return {
+                    'query_id': query_id,
+                    'question': question,
+                    'sql': cached_result["sql"],
+                    'explanation': cached_result.get("explanation", "This SQL will retrieve data from your database. Please review before approving."),
+                    'status': 'pending_approval',
+                    'cache_hit': True,
+                    'cost_saved': "$0.08"  # Approximate GPT-4o cost per SQL generation
+                }
+
         try:
             # Generate SQL using Vanna 2.0 Agent
             sql = await self.vanna.generate_sql_async(
                 question=question,
                 schema_context=self.schema_context
             )
+
+            explanation = "This SQL will retrieve data from your database. Please review before approving."
+
+            # Cache the SQL generation result (if cache service is available)
+            if self.query_cache_service and self.query_cache_service.enabled:
+                cache_key = self.query_cache_service.get_sql_gen_key(question)
+                cache_value = {
+                    "sql": sql,
+                    "explanation": explanation,
+                    "question": question
+                }
+                ttl = settings.CACHE_TTL_SQL_GEN  # Default: 24 hours
+                self.query_cache_service.set(cache_key, cache_value, ttl=ttl, cache_type="sql_gen")
+                logger.info(f"SQL generation cache MISS - cached for '{question[:50]}...' (TTL: {ttl}s)")
 
             # Create unique query ID for approval workflow
             query_id = str(uuid.uuid4())
@@ -426,15 +477,18 @@ Columns:
                 'question': question,
                 'sql': sql,
                 'status': 'pending_approval',
-                'generated_at': pd.Timestamp.now().isoformat()
+                'generated_at': pd.Timestamp.now().isoformat(),
+                'cache_hit': False
             }
 
             return {
                 'query_id': query_id,
                 'question': question,
                 'sql': sql,
-                'explanation': "This SQL will retrieve data from your database. Please review before approving.",
-                'status': 'pending_approval'
+                'explanation': explanation,
+                'status': 'pending_approval',
+                'cache_hit': False,
+                'cost_saved': "$0.00"
             }
 
         except Exception as e:
@@ -444,12 +498,17 @@ Columns:
         """
         Execute a SQL query after user approval using Vanna 2.0 Agent.
 
+        NEW: Implements SQL result caching for SELECT queries.
+        - Cache key: hash(normalized_sql)
+        - Cache TTL: 15 minutes (data changes frequently)
+        - Only caches read-only SELECT queries
+
         Args:
             query_id: ID of the pending query
             approved: Whether the user approved execution
 
         Returns:
-            Dictionary with results or rejection message
+            Dictionary with results or rejection message, plus cache_hit indicator
         """
         if query_id not in self.pending_queries:
             return {
@@ -468,10 +527,49 @@ Columns:
                 'message': 'Query execution cancelled by user'
             }
 
+        sql = query_info['sql']
+
+        # Check if this is a SELECT query (safe to cache)
+        is_select_query = sql.strip().upper().startswith("SELECT")
+
+        # Check cache for SELECT queries only
+        if is_select_query and self.query_cache_service and self.query_cache_service.enabled:
+            cache_key = self.query_cache_service.get_sql_result_key(sql)
+            cached_result = self.query_cache_service.get(cache_key, cache_type="sql_result")
+
+            if cached_result and "results" in cached_result:
+                logger.info(f"SQL result cache HIT for query: '{sql[:50]}...'")
+
+                # Clean up pending query
+                del self.pending_queries[query_id]
+
+                return {
+                    'query_id': query_id,
+                    'question': query_info['question'],
+                    'sql': sql,
+                    'results': cached_result["results"],
+                    'result_count': cached_result["result_count"],
+                    'status': 'executed',
+                    'cache_hit': True,
+                    'cached_at': cached_result.get("executed_at")
+                }
+
         # Execute the SQL using Vanna 2.0 Agent
         try:
-            sql = query_info['sql']
             results = await self.vanna.execute_sql_async(sql)
+
+            # Cache SELECT query results (if cache service is available)
+            if is_select_query and self.query_cache_service and self.query_cache_service.enabled:
+                cache_key = self.query_cache_service.get_sql_result_key(sql)
+                cache_value = {
+                    "results": results,
+                    "result_count": len(results),
+                    "sql": sql,
+                    "executed_at": pd.Timestamp.now().isoformat()
+                }
+                ttl = settings.CACHE_TTL_SQL_RESULT  # Default: 15 minutes
+                self.query_cache_service.set(cache_key, cache_value, ttl=ttl, cache_type="sql_result")
+                logger.info(f"SQL result cache MISS - cached for '{sql[:50]}...' (TTL: {ttl}s)")
 
             # Clean up pending query
             del self.pending_queries[query_id]
@@ -482,7 +580,8 @@ Columns:
                 'sql': sql,
                 'results': results,
                 'result_count': len(results),
-                'status': 'executed'
+                'status': 'executed',
+                'cache_hit': False
             }
 
         except Exception as e:
