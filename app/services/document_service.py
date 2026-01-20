@@ -35,7 +35,12 @@ def parse_document(file_path: str) -> str:
 
     try:
         # Use Unstructured.io's auto partition to handle any file type
-        elements = partition(filename=file_path)
+        # strategy="fast" disables OCR (tesseract) for Lambda compatibility
+        # OCR can be enabled by adding tesseract Lambda layer and using strategy="hi_res"
+        elements = partition(
+            filename=file_path,
+            strategy="fast"  # Fast mode: no OCR, works without tesseract
+        )
 
         # Combine all elements into a single text string
         text = "\n\n".join([str(el) for el in elements])
