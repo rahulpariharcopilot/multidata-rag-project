@@ -218,7 +218,8 @@ class VannaAgentWrapper:
 
     async def _execute_and_extract_results(self, sql: str) -> List[Dict[str, Any]]:
         """
-        Execute SQL via Agent and extract DataFrame from UI components.
+        Execute SQL via Vanna Agent and extract results from DataFrameComponent.
+        Uses early exit (break) to avoid async generator lifecycle issues in Lambda.
 
         Args:
             sql: SQL query to execute
@@ -232,15 +233,26 @@ class VannaAgentWrapper:
         # Ask Agent to run the SQL
         message = f"Execute this SQL query:\n\n```sql\n{sql}\n```"
 
+        logger.info(f"Executing SQL via Vanna Agent: {sql[:100]}...")
+
         async for component in self.agent.send_message(
             request_context=request_context,
             message=message
         ):
             rich_comp = component.rich_component
 
+            # Log component type for debugging Lambda issues
+            component_type = type(rich_comp).__name__
+            logger.debug(f"Received component: {component_type}")
+
             # Extract data from DataFrameComponent
             if hasattr(rich_comp, 'rows') and rich_comp.rows:
                 results = rich_comp.rows
+                logger.info(f"✓ Found results: {len(results)} rows")
+                break  # ✅ Exit immediately - critical for Lambda compatibility
+
+        if not results:
+            logger.warning("No results found in Agent response stream")
 
         return results
 
