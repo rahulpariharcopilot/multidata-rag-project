@@ -371,6 +371,22 @@ jobs:
           echo "✅ Test document created"
           echo ""
 
+          # Force Lambda cold start by waiting for old containers to expire
+          echo "⏳ Waiting 60 seconds for Lambda to fully switch to new containers..."
+          echo "   (Old warm containers from previous deployment must expire)"
+          for i in {60..1}; do
+            echo -n "   $i seconds remaining..."
+            sleep 1
+            echo -ne "\r"
+          done
+          echo "   ✅ Wait complete!"
+          echo ""
+
+          # Warm up Lambda with a health check (triggers lazy initialization)
+          echo "🔥 Warming up Lambda with health check (triggers lazy init)..."
+          curl -f -s "$API_URL/health" > /dev/null && echo "   ✅ Health check passed, Lambda warmed up!" || echo "   ⚠️  Health check failed (will retry on upload)"
+          echo ""
+
           # Test 1: Initial upload (should NOT be cached)
           echo "📤 Test 1: Initial document upload (expect cache_hit=false)..."
           UPLOAD1_RESPONSE=$(curl -s -X POST "$API_URL/upload" \
