@@ -367,6 +367,7 @@ async def upload_document(file: UploadFile = File(...)):
             "chunks_created": len(chunks),
             "total_tokens": total_tokens,
             "cache_hit": cache_hit,  # NEW: Indicate if cache was used
+            "storage_backend": cache_service.backend if cache_service else "none",  # NEW: Report storage backend
             "message": (
                 f"Document loaded from cache and {len(chunks)} chunks stored in Pinecone"
                 if cache_hit
