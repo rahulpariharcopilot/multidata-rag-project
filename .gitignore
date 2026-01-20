@@ -27,6 +27,9 @@ venv/
 ENV/
 env/
 
+# UV lock file (not needed in repo, dependencies defined in requirements.txt)
+uv.lock
+
 # Environment Variables
 .env
 .env.local
