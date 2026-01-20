@@ -1223,10 +1223,12 @@ def initialize_services():
 
 
 # Event handlers for startup/shutdown
-@app.on_event("startup")
-async def startup_event():
-    """Execute tasks on application startup."""
-    initialize_services()
+# NOTE: Startup event disabled for Lambda (initialization handled in lambda_handler.py)
+# Uncomment for local development with uvicorn
+# @app.on_event("startup")
+# async def startup_event():
+#     """Execute tasks on application startup."""
+#     initialize_services()
 
 
 @app.on_event("shutdown")
