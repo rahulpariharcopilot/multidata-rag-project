@@ -242,39 +242,24 @@ class VannaAgentWrapper:
         ):
             component_count += 1
             rich_comp = component.rich_component
-
-            # Log component type for debugging Lambda issues
             component_type = type(rich_comp).__name__
-            logger.info(f"Received component #{component_count}: {component_type}")
 
-            # Log all attributes to understand component structure
-            attrs = [attr for attr in dir(rich_comp) if not attr.startswith('_')]
-            logger.info(f"  Component attributes: {', '.join(attrs[:10])}")  # First 10 attrs
+            # Check for DataFrame component with .rows attribute (primary method)
+            if hasattr(rich_comp, 'rows') and rich_comp.rows:
+                results = rich_comp.rows
+                logger.info(f"✓ Found {len(results)} rows in {component_type} (component #{component_count})")
+                break  # ✅ Exit immediately - critical for Lambda compatibility
 
-            # Check for various possible data attributes
-            if hasattr(rich_comp, 'rows'):
-                logger.info(f"  HAS .rows: {rich_comp.rows is not None}, length: {len(rich_comp.rows) if rich_comp.rows else 0}")
-                if rich_comp.rows:
-                    results = rich_comp.rows
-                    logger.info(f"✓ Found results in .rows: {len(results)} rows - exiting loop")
-                    break  # ✅ Exit immediately - critical for Lambda compatibility
+            # Check for alternative data storage methods
+            if hasattr(rich_comp, 'dataframe') and rich_comp.dataframe is not None:
+                try:
+                    results = rich_comp.dataframe.to_dict('records')
+                    logger.info(f"✓ Found {len(results)} rows in {component_type}.dataframe (component #{component_count})")
+                    break
+                except Exception as e:
+                    logger.debug(f"Could not extract from {component_type}.dataframe: {e}")
 
-            # Check for DataFrame attribute (alternative)
-            if hasattr(rich_comp, 'dataframe'):
-                logger.info(f"  HAS .dataframe attribute")
-                if rich_comp.dataframe is not None:
-                    try:
-                        results = rich_comp.dataframe.to_dict('records')
-                        logger.info(f"✓ Found results in .dataframe: {len(results)} rows - exiting loop")
-                        break
-                    except Exception as e:
-                        logger.warning(f"  Failed to extract from .dataframe: {e}")
-
-            # Check for data attribute (alternative)
-            if hasattr(rich_comp, 'data'):
-                logger.info(f"  HAS .data attribute")
-
-        logger.info(f"Async loop completed. Total components received: {component_count}")
+        logger.info(f"Processed {component_count} components from Agent")
 
         if not results:
             logger.warning("No results found in Agent response stream")
