@@ -1,8 +1,8 @@
 # Multi-Source RAG + Text-to-SQL Project - Implementation Context
 
-**Last Updated:** 2025-12-11
+**Last Updated:** 2026-01-21
 **Current Status:** ALL PHASES COMPLETE - Production-Ready System Fully Deployed
-**Current Phase:** Project Complete - All 6 Phases Finished
+**Current Phase:** Project Complete - All 6 Phases Finished + Lambda IPv4 Fix
 
 ---
 
@@ -30,11 +30,17 @@
    - Use DeepWiki MCP for latest documentation
    - Original plan had deprecated versions
 
-4. **External Services Status:** Partial setup needed
-   - OpenAI: Status pending verification
-   - Pinecone: Need to create account and index
-   - Supabase: Need to create project
-   - OPIK: Need to create account
+4. **Database Connection:** Supabase Session Pooler (IPv4)
+   - AWS Lambda doesn't support IPv6 outbound connections
+   - Use Session Pooler instead of Direct Connection
+   - Connection format: `postgres.{project-ref}@aws-1-ap-south-1.pooler.supabase.com`
+   - IPv4-proxied for Lambda compatibility
+
+5. **External Services Status:** All configured
+   - OpenAI: ✅ Configured
+   - Pinecone: ✅ Configured (rag-documents, vanna-sql-training)
+   - Supabase: ✅ Configured (Session Pooler for IPv4)
+   - OPIK: ✅ Configured
 
 ---
 
